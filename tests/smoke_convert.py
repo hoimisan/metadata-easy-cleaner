@@ -33,6 +33,8 @@ def main() -> None:
         output_format="PNG",
         output_dir=out_dir,
         rename_pattern="{name}_{number}",
+        save_to_source_dir=False,
+        open_output_dir=False,
         jpeg_quality=95,
         png_compress_level=6,
         overwrite=True,
@@ -50,10 +52,29 @@ def main() -> None:
         assert not converted.info
         assert not read_image_metadata(png_output)
 
+    same_folder_options = ConvertOptions(
+        output_format="PNG",
+        output_dir=out_dir,
+        rename_pattern="{name}_same_folder",
+        save_to_source_dir=True,
+        open_output_dir=False,
+        jpeg_quality=95,
+        png_compress_level=6,
+        overwrite=True,
+        enhance_enabled=False,
+        sharpness=1.0,
+        contrast=1.0,
+        color=1.0,
+    )
+    same_folder_output = build_output_path(source, 1, 1, same_folder_options)
+    assert same_folder_output.parent == source.parent
+
     jpg_options = ConvertOptions(
         output_format="JPEG",
         output_dir=out_dir,
         rename_pattern="{name}_jpg",
+        save_to_source_dir=False,
+        open_output_dir=False,
         jpeg_quality=92,
         png_compress_level=6,
         overwrite=True,

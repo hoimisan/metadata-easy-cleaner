@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import json
+import os
 import queue
 import re
+import subprocess
+import sys
 import threading
 from dataclasses import dataclass
 from pathlib import Path
@@ -23,6 +27,8 @@ except ImportError:
 
 
 SUPPORTED_INPUTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"}
+APP_DIR_NAME = "AIImageMetadataCleaner"
+DEFAULT_OUTPUT_DIR = Path.cwd() / "converted"
 
 
 @dataclass(frozen=True)
@@ -30,6 +36,8 @@ class ConvertOptions:
     output_format: str
     output_dir: Path
     rename_pattern: str
+    save_to_source_dir: bool
+    open_output_dir: bool
     jpeg_quality: int
     png_compress_level: int
     overwrite: bool
@@ -46,6 +54,37 @@ def natural_key(path: Path) -> list[object]:
 def sanitize_filename(name: str) -> str:
     sanitized = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name).strip(" .")
     return sanitized or "image"
+
+
+def config_path() -> Path:
+    base_dir = Path(os.getenv("APPDATA") or Path.home())
+    return base_dir / APP_DIR_NAME / "settings.json"
+
+
+def load_settings() -> dict[str, str]:
+    path = config_path()
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_settings(settings: dict[str, str]) -> None:
+    path = config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(settings, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def open_folder(path: Path) -> None:
+    if sys.platform.startswith("win"):
+        os.startfile(path)  # type: ignore[attr-defined]
+    elif sys.platform == "darwin":
+        subprocess.Popen(["open", str(path)])
+    else:
+        subprocess.Popen(["xdg-open", str(path)])
 
 
 def discover_images(paths: list[str]) -> list[Path]:
@@ -104,13 +143,14 @@ def build_output_path(source: Path, index: int, total: int, options: ConvertOpti
     else:
         stem = source.stem
     stem = sanitize_filename(stem)
-    output_path = options.output_dir / f"{stem}{extension}"
+    output_dir = source.parent if options.save_to_source_dir else options.output_dir
+    output_path = output_dir / f"{stem}{extension}"
     if options.overwrite or not output_path.exists():
         return output_path
 
     counter = 2
     while True:
-        candidate = options.output_dir / f"{stem}_{counter}{extension}"
+        candidate = output_dir / f"{stem}_{counter}{extension}"
         if not candidate.exists():
             return candidate
         counter += 1
@@ -178,10 +218,13 @@ class MetadataCleanerApp:
         self.files: list[Path] = []
         self.log_queue: queue.Queue[tuple[str, object]] = queue.Queue()
         self.worker: threading.Thread | None = None
+        self.settings = load_settings()
 
         self.output_format = StringVar(value="PNG")
-        self.output_dir = StringVar(value=str(Path.cwd() / "converted"))
+        self.output_dir = StringVar(value=self.settings.get("output_dir", str(DEFAULT_OUTPUT_DIR)))
         self.rename_pattern = StringVar(value="{name}_clean")
+        self.save_to_source_dir = BooleanVar(value=False)
+        self.open_output_dir = BooleanVar(value=False)
         self.jpeg_quality = IntVar(value=95)
         self.png_compress_level = IntVar(value=6)
         self.overwrite = BooleanVar(value=False)
@@ -193,6 +236,7 @@ class MetadataCleanerApp:
         self.progress = IntVar(value=0)
 
         self._build_ui()
+        self._sync_output_dir_controls()
         self._setup_drop()
         self.root.after(120, self._poll_queue)
 
@@ -236,8 +280,10 @@ class MetadataCleanerApp:
         format_box.grid(row=0, column=1, sticky="ew", pady=(0, 6))
 
         ttk.Label(option_frame, text="保存先").grid(row=1, column=0, sticky="w", pady=6)
-        ttk.Entry(option_frame, textvariable=self.output_dir).grid(row=1, column=1, sticky="ew", pady=6)
-        ttk.Button(option_frame, text="参照", command=self.choose_output_dir).grid(row=1, column=2, padx=(8, 0), pady=6)
+        self.output_dir_entry = ttk.Entry(option_frame, textvariable=self.output_dir)
+        self.output_dir_entry.grid(row=1, column=1, sticky="ew", pady=6)
+        self.output_dir_button = ttk.Button(option_frame, text="参照", command=self.choose_output_dir)
+        self.output_dir_button.grid(row=1, column=2, padx=(8, 0), pady=6)
 
         ttk.Label(option_frame, text="保存名").grid(row=2, column=0, sticky="w", pady=6)
         ttk.Entry(option_frame, textvariable=self.rename_pattern).grid(row=2, column=1, columnspan=2, sticky="ew", pady=6)
@@ -245,24 +291,31 @@ class MetadataCleanerApp:
         hint = ttk.Label(option_frame, text="{name}, {index}, {number}, {ext} が使えます")
         hint.grid(row=3, column=1, columnspan=2, sticky="w", pady=(0, 10))
 
-        ttk.Checkbutton(option_frame, text="同名ファイルを上書き", variable=self.overwrite).grid(row=4, column=1, columnspan=2, sticky="w", pady=4)
+        ttk.Checkbutton(
+            option_frame,
+            text="元画像と同じフォルダに保存する",
+            variable=self.save_to_source_dir,
+            command=self._sync_output_dir_controls,
+        ).grid(row=4, column=1, columnspan=2, sticky="w", pady=4)
+        ttk.Checkbutton(option_frame, text="変換後フォルダを開く", variable=self.open_output_dir).grid(row=5, column=1, columnspan=2, sticky="w", pady=4)
+        ttk.Checkbutton(option_frame, text="同名ファイルを上書き", variable=self.overwrite).grid(row=6, column=1, columnspan=2, sticky="w", pady=4)
 
-        ttk.Label(option_frame, text="JPEG品質").grid(row=5, column=0, sticky="w", pady=(16, 6))
-        ttk.Scale(option_frame, from_=70, to=100, variable=self.jpeg_quality, orient=tk.HORIZONTAL).grid(row=5, column=1, sticky="ew", pady=(16, 6))
-        ttk.Label(option_frame, textvariable=self.jpeg_quality).grid(row=5, column=2, padx=(8, 0), pady=(16, 6))
+        ttk.Label(option_frame, text="JPEG品質").grid(row=7, column=0, sticky="w", pady=(16, 6))
+        ttk.Scale(option_frame, from_=70, to=100, variable=self.jpeg_quality, orient=tk.HORIZONTAL).grid(row=7, column=1, sticky="ew", pady=(16, 6))
+        ttk.Label(option_frame, textvariable=self.jpeg_quality).grid(row=7, column=2, padx=(8, 0), pady=(16, 6))
 
-        ttk.Label(option_frame, text="PNG圧縮").grid(row=6, column=0, sticky="w", pady=6)
-        ttk.Scale(option_frame, from_=0, to=9, variable=self.png_compress_level, orient=tk.HORIZONTAL).grid(row=6, column=1, sticky="ew", pady=6)
-        ttk.Label(option_frame, textvariable=self.png_compress_level).grid(row=6, column=2, padx=(8, 0), pady=6)
+        ttk.Label(option_frame, text="PNG圧縮").grid(row=8, column=0, sticky="w", pady=6)
+        ttk.Scale(option_frame, from_=0, to=9, variable=self.png_compress_level, orient=tk.HORIZONTAL).grid(row=8, column=1, sticky="ew", pady=6)
+        ttk.Label(option_frame, textvariable=self.png_compress_level).grid(row=8, column=2, padx=(8, 0), pady=6)
 
-        ttk.Separator(option_frame).grid(row=7, column=0, columnspan=3, sticky="ew", pady=16)
+        ttk.Separator(option_frame).grid(row=9, column=0, columnspan=3, sticky="ew", pady=16)
 
-        ttk.Checkbutton(option_frame, text="簡易画質改善を使う", variable=self.enhance_enabled).grid(row=8, column=0, columnspan=3, sticky="w", pady=4)
-        self._add_slider(option_frame, 9, "シャープ", self.sharpness, 0.5, 2.0)
-        self._add_slider(option_frame, 10, "コントラスト", self.contrast, 0.7, 1.5)
-        self._add_slider(option_frame, 11, "彩度", self.color, 0.7, 1.5)
+        ttk.Checkbutton(option_frame, text="簡易画質改善を使う", variable=self.enhance_enabled).grid(row=10, column=0, columnspan=3, sticky="w", pady=4)
+        self._add_slider(option_frame, 11, "シャープ", self.sharpness, 0.5, 2.0)
+        self._add_slider(option_frame, 12, "コントラスト", self.contrast, 0.7, 1.5)
+        self._add_slider(option_frame, 13, "彩度", self.color, 0.7, 1.5)
 
-        ttk.Button(option_frame, text="変換開始", command=self.start_conversion).grid(row=12, column=0, columnspan=3, sticky="ew", pady=(24, 8), ipady=8)
+        ttk.Button(option_frame, text="変換開始", command=self.start_conversion).grid(row=14, column=0, columnspan=3, sticky="ew", pady=(24, 8), ipady=8)
 
         bottom = ttk.Frame(self.root, padding=(12, 0, 12, 12))
         bottom.grid(row=2, column=0, sticky="ew")
@@ -281,6 +334,11 @@ class MetadataCleanerApp:
 
         variable.trace_add("write", refresh)
         refresh()
+
+    def _sync_output_dir_controls(self) -> None:
+        state = "disabled" if self.save_to_source_dir.get() else "normal"
+        self.output_dir_entry.configure(state=state)
+        self.output_dir_button.configure(state=state)
 
     def _setup_drop(self) -> None:
         if not DND_FILES:
@@ -384,6 +442,14 @@ class MetadataCleanerApp:
         selected = filedialog.askdirectory(title="保存先フォルダを選択")
         if selected:
             self.output_dir.set(selected)
+            self._save_output_dir_setting()
+
+    def _save_output_dir_setting(self) -> None:
+        self.settings["output_dir"] = str(Path(self.output_dir.get()).expanduser())
+        try:
+            save_settings(self.settings)
+        except OSError:
+            pass
 
     def _refresh_file_list(self) -> None:
         self.file_list.delete(0, tk.END)
@@ -395,6 +461,8 @@ class MetadataCleanerApp:
             output_format=self.output_format.get(),
             output_dir=Path(self.output_dir.get()).expanduser(),
             rename_pattern=self.rename_pattern.get(),
+            save_to_source_dir=self.save_to_source_dir.get(),
+            open_output_dir=self.open_output_dir.get(),
             jpeg_quality=int(self.jpeg_quality.get()),
             png_compress_level=int(self.png_compress_level.get()),
             overwrite=self.overwrite.get(),
@@ -413,7 +481,9 @@ class MetadataCleanerApp:
             return
         try:
             options = self._current_options()
-            options.output_dir.mkdir(parents=True, exist_ok=True)
+            if not options.save_to_source_dir:
+                options.output_dir.mkdir(parents=True, exist_ok=True)
+                self._save_output_dir_setting()
         except Exception as exc:
             messagebox.showerror("保存先エラー", str(exc))
             return
@@ -426,11 +496,13 @@ class MetadataCleanerApp:
 
     def _convert_worker(self, files: list[Path], options: ConvertOptions) -> None:
         errors: list[str] = []
+        output_dirs: set[str] = set()
         total = len(files)
         for index, source in enumerate(files, start=1):
             try:
                 output_path = build_output_path(source, index, total, options)
                 convert_image(source, output_path, options)
+                output_dirs.add(str(output_path.parent))
                 self.log_queue.put(("status", f"{index}/{total} 変換済み: {output_path.name}"))
             except (OSError, UnidentifiedImageError, ValueError) as exc:
                 errors.append(f"{source.name}: {exc}")
@@ -438,7 +510,7 @@ class MetadataCleanerApp:
                 errors.append(f"{source.name}: {exc}")
             finally:
                 self.log_queue.put(("progress", int(index / total * 100)))
-        self.log_queue.put(("done", errors))
+        self.log_queue.put(("done", {"errors": errors, "output_dirs": sorted(output_dirs), "open_output_dir": options.open_output_dir}))
 
     def _poll_queue(self) -> None:
         try:
@@ -449,16 +521,31 @@ class MetadataCleanerApp:
                 elif kind == "progress":
                     self.progress.set(int(payload))
                 elif kind == "done":
-                    errors = payload if isinstance(payload, list) else []
+                    result = payload if isinstance(payload, dict) else {}
+                    errors = result.get("errors", []) if isinstance(result.get("errors", []), list) else []
                     if errors:
                         self.status.set(f"完了: エラー {len(errors)} 件")
+                        if result.get("open_output_dir"):
+                            self._open_output_dirs(result.get("output_dirs", []))
                         messagebox.showwarning("一部変換できませんでした", "\n".join(errors[:20]))
                     else:
                         self.status.set("変換が完了しました")
+                        if result.get("open_output_dir"):
+                            self._open_output_dirs(result.get("output_dirs", []))
                         messagebox.showinfo("完了", "すべての画像を変換しました。")
         except queue.Empty:
             pass
         self.root.after(120, self._poll_queue)
+
+    def _open_output_dirs(self, output_dirs: object) -> None:
+        if not isinstance(output_dirs, list):
+            return
+        for raw_dir in output_dirs[:5]:
+            try:
+                open_folder(Path(str(raw_dir)))
+            except OSError as exc:
+                messagebox.showwarning("フォルダを開けませんでした", str(exc))
+                break
 
     def run(self) -> None:
         self.root.mainloop()
